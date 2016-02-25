@@ -8,11 +8,17 @@ an interact shell.
 """
 
 from collections import defaultdict
+from itertools import groupby
 import socket
+import re
+import os.path
 import logging
 import paramiko
 
 __author__ = "lqs"
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
+logger = logging.getLogger(__name__)
 
 
 class SSH2:
@@ -22,9 +28,10 @@ class SSH2:
         self.host = host
         self.port = port
         self.buffersize = buffersize
-        self.logger = logging.getLogger(__file__)
         self.ssh = None
         self.chan = None
+
+        self.make_chan()
 
     def __del__(self):
         if self.chan is not None:
@@ -36,7 +43,7 @@ class SSH2:
             self.ssh = None
 
     def make_chan(self):
-        self.logger.debug('Connecting {0}@{1}:{2}'.format(self.username, self.host, self.port))
+        logger.info('Connecting [{0}@{1}:{2}]'.format(self.username, self.host, self.port))
 
         self.ssh = paramiko.SSHClient()
         self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -46,22 +53,19 @@ class SSH2:
             self.chan = self.ssh.invoke_shell(width=120, height=200)
         except socket.error:
             self.chan = None
-            self.logger.error('Socket error on connecting {0}@{1}:{2}'.format(self.username,
-                                                                              self.host, self.port))
+            logger.error('Socket error on connecting [{0}@{1}:{2}]'.format(self.username,
+                                                                           self.host, self.port))
         except paramiko.AuthenticationException:
             self.chan = None
-            self.logger.error('Invalid username or password.')
+            logger.error('Invalid username or password.')
         except paramiko.SSHException:
             self.chan = None
-            self.logger.error('Establishing or connecting SSH session failed.')
+            logger.error('Establishing or connecting SSH session failed.')
 
-        return self.chan is not None
+    def shutdown(self):
+        self.__del__()
 
-    @property
-    def connected(self):
-        return self.chan is not None
-
-    def _execute(self, command, timeout=6):
+    def _execute(self, command, timeout=30):
         results = b''
         self.chan.settimeout(timeout)
 
@@ -71,15 +75,11 @@ class SSH2:
                 # Note: if we set the timeout, the data received may not be complete.
                 data = self.chan.recv(self.buffersize)
 
-                # Skip the warning or welcome messages.
-                if data.startswith(b'\r\r\n') or data.startswith(b'*'):
-                    continue
-
                 # Execute the command.
                 # Note: The command may be executed twice, refer to:
                 # https://erlerobotics.gitbooks.io/erle-robotics-python-gitbook-free/content/telnet_and_ssh/shell_sessions_and_individual_commands.html
                 # It is strange that it happens occasionally, not always.
-                if data.startswith(b'<SH-'):
+                if re.match(b'<\w.*>', data):
                     self.chan.send(command+'\n')
                     if self.chan.recv_ready():
                         data = self.chan.recv(self.buffersize)
@@ -99,62 +99,62 @@ class SSH2:
         return results
 
     def execute(self, command):
-        self.logger.info('Initialize a session to execute the command.')
-
-        if not self.connected:
+        if not self.chan:
+            logger.info('Channel is not open. Starting to make a channel.')
             self.make_chan()
 
+        logger.info('Starting to execute [{}].'.format(command))
         outputs = self._execute(command)
         return outputs
 
-    def _parse(self, data):
-        ret = []
+# Learn from the python3-cookbook.
+def dedupe(items, key=None):
+    seen = set()
+    for item in items:
+        val = item if key is None else key(item)
+        if val not in seen:
+            seen.add(item)
+    return list(seen)
 
-        # The command may not be executed completely, or may be executed twice.
-        nums = [num for num, line in enumerate(data) if line.startswith('<SH-')]
-        if len(nums) < 2:
-            raise OSError('The output of the command is not complete.')
-        if len(nums) > 2:
-            data = data[:sorted(nums)[1]]
+def get_mac_addr(data):
+    """Extract from the original bytes string received from channel to get valid mac addresses.
 
-        for line in data:
-            if line == '---- More ----' or line.startswith('<SH-'):
-                continue
-            ret.extend([x.strip() for x in line.split(' Y') if x.strip()])
+    Note: Because the ``timeout``, the data may be incomplete; or because the command may be
+    executed twice, the data may contain duplicate items.
+    """
+    outputs = defaultdict(list)
+    ret = []
 
-        item = ret.pop(0)
-        ret.insert(0, item.split('Aging')[1])
-        return ret
+    # Find the first literal hostname looks like ``<AA-BB-C01>``, and skip the warning or welcome
+    # message.
+    host = re.search(b'<\w.*>', data)
+    if not host:
+        raise IOError('Command has not been executed.')
 
-    def parse_output(self, output):
-        results = defaultdict(list)
+    pre_ret = data.split(host.group())
+    if not pre_ret:
+        raise IOError('No outputs')
 
-        ret = self._parse([x.strip().decode() for x in output.splitlines() if x.strip()])
-        for item in ret:
-            x = item.split()
-            if len(x) <= 3:
-                print('Invalid data: ', x)
-                continue
+    if len(pre_ret) < 3:
+        logger.warning('Outputs may be incomplete.')
 
-            if int(x[3].split('BAGG')[1]) <= 48:
-                results[x[3]].append(x[0])
+    lines = [line.strip() for line in pre_ret[1].splitlines() if line.strip()]
+    for line in lines:
+        # skip the useless line or useless line.
+        # Note: Some valid line may also be splited into more than one parts.
+        try:
+            mac, vlan, state, port, age = line.split()
+        except ValueError:
+            logger.error('Invalid format of line: {}'.format(line.decode()))
+            continue
+        outputs[port.strip().decode()].append(mac.strip().decode())
 
-        return results
+    # Erase the useless items and expand mac-addresses.
+    for k in outputs:
+        if len(outputs[k]) > 5:
+            continue
+        for mac in outputs[k]:
+            ret.append(' '.join([k, mac]))
 
-def main():
-    command = 'dis mac-address'
-    with open('ips') as f:
-        for line in f.readlines():
-            auth = [i.strip() for i in line.split()]
-            ssh = SSH2(host=auth[0], username=auth[1], password=auth[2])
-            output = ssh.execute(command)
-            data = ssh.parse_output(output)
+    return ret
 
-            for key in sorted(data, key=lambda x: int(x.split('BAGG')[1].strip())):
-                print((key, data[key]))
-            #
-            # with open('result_{}'.format(auth[0]), 'wb') as f:
-            #     f.write(data)
-
-if __name__ == '__main__':
-    main()
